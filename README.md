@@ -54,6 +54,19 @@ what was deliberately rejected, and the compatibility rules. The studied sources
 checked out under `ref/` (git-ignored): `ref/piscina` and `ref/go` (sparse:
 `src/runtime` + `src/sync`).
 
+## What measurement changed
+
+The scheduler work was driven by numbers, not vibes (see RESEARCH-scheduling.md):
+
+* **Batch dispatch was implemented and then deleted** - it made every workload slower
+  (2000 tiny tasks: 38.5 ms -> 97.7 ms on 4 workers, 74.6 ms -> 348 ms on 1). Go batches
+  to avoid per-P queue lock contention; this pool has one shared queue and ~20 µs
+  dispatch, so batching only costs parallelism.
+* **The real bug it exposed got fixed**: the `overflow: 'wait'` producer parked with
+  `setTimeout(1)`, capping a burst at ~1 task/ms. Producers now park on a waiter queue and
+  are woken by the dequeue that frees room - 2000 tiny tasks went **74.6 ms -> 48 ms**
+  (1 worker) and **38.5 ms -> 29.4 ms** (4 workers).
+
 ## Sharp edges (documented, not hidden)
 
 * JS cannot preempt: every "goroutine" is cooperative at `await` boundaries.

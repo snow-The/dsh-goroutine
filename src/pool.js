@@ -101,7 +101,7 @@ class PoolWorker {
   }
   post(task) {
     this.start();
-    if (typeof this.worker.ref === 'function') this.worker.ref();   // hold the process while work is in flight
+    if (typeof this.worker.ref === 'function') this.worker.ref.call(this.worker);   // hold the process while work is in flight
     this.active.set(task.id, task);
     const msg = { id: task.id, kind: task.kind, target: task.target, export: task.export, args: task.args };
     if (task.transfer !== undefined) this.worker.postMessage(msg, task.transfer);
@@ -119,6 +119,7 @@ export class Pool extends EventEmitter {
   #closed = false;
   #queue;
   #pendingWaiters = [];
+  #roomWaiters = [];   // producers parked because the queue was full
   #nextWorkerId = 1;
   #nextTaskId = 1;
 
@@ -129,6 +130,12 @@ export class Pool extends EventEmitter {
     this.minSize = Math.max(0, Math.min(Math.floor(Number(options.minThreads ?? 0) || 0), this.maxSize));
     this.idleTimeout = options.idleTimeout === undefined ? 10_000 : Number(options.idleTimeout);
     this.concurrentTasksPerWorker = Math.max(1, Math.floor(Number(options.concurrentTasksPerWorker ?? 1) || 1));
+    // NOTE: batch dispatch was implemented and measured; it made every workload
+    // slower (2000 tiny tasks: 38.5 ms -> 97.7 ms on 4 workers, 74.6 ms -> 348 ms
+    // on 1) because a batch occupies one worker while the others starve. Go's
+    // runqget/runqsteal batching exists to cut lock contention on PER-P QUEUES;
+    // this queue is shared and dispatch is already ~20 us. See
+    // RESEARCH-scheduling.md §4. Not shipped.
     const maxQueue = options.maxQueue === undefined ? this.maxSize * 64 : Number(options.maxQueue);
     this.#queue = new RingQueue(maxQueue);
     this.overflow = options.overflow ?? 'wait';         // 'wait' (Go's blocking send) | 'throw'
@@ -136,6 +143,8 @@ export class Pool extends EventEmitter {
     this.name = options.name ?? 'goroutine-pool';
     this.completed = 0;
     this.failed = 0;
+    this.dispatches = 0;
+    this.#roomWaiters = [];
     this.workers = new Set();
     this.spawnedTotal = 0;
 
@@ -150,7 +159,7 @@ export class Pool extends EventEmitter {
   stats() {
     return {
       size: this.size, maxSize: this.maxSize, queueSize: this.queueSize, activeTasks: this.activeTasks,
-      completed: this.completed, failed: this.failed, spawnedTotal: this.spawnedTotal,
+      completed: this.completed, failed: this.failed, spawnedTotal: this.spawnedTotal, dispatches: this.dispatches,
       workers: [...this.workers].map((w) => ({ id: w.threadId, state: w.state, active: w.busy })),
     };
   }
@@ -226,17 +235,18 @@ export class Pool extends EventEmitter {
 
   async _dispatch(entry) {
     for (;;) {
-      const worker = this._pickWorker();
-      if (worker !== null) { worker.post(entry); return; }
-      if (!this.#queue.full || this.overflow === 'throw') {
-        if (this.#queue.full) throw new Error('goroutine: queue is full (' + this.#queue.capacity + ')');
+      if (this.#closed) throw new Error('goroutine: pool is closed');
+      if (!this.#queue.full) {
         this.#queue.push(entry);
-        this._maybeScale();
+        this._pump();
         return;
       }
-      // overflow: 'wait' - block the producer like a full Go channel send.
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      if (this.#closed) throw new Error('goroutine: pool is closed');
+      if (this.overflow === 'throw') throw new Error('goroutine: queue is full (' + this.#queue.capacity + ')');
+      // overflow: 'wait' - park the producer like a full Go channel send. The
+      // wake is event-driven (mirrors Go's sudog on a channel's sendq); the first
+      // version polled with setTimeout(1), which capped a burst of 2000 tiny
+      // tasks at ~1 task/ms - measured, not guessed.
+      await new Promise((resolve) => this.#roomWaiters.push(resolve));
     }
   }
 
@@ -284,13 +294,23 @@ export class Pool extends EventEmitter {
     }
   }
 
+  /** Hand one queued task to the least-loaded worker that has capacity. */
   _pump() {
     while (this.#queue.size > 0) {
       const worker = this._pickWorker();
       if (worker === null) return;
       const task = this.#queue.shift();
+      this.dispatches++;
       worker.post(task);
+      this.emit('dispatch', { worker: worker.threadId, count: 1 });
+      this.#releaseRoom();
     }
+  }
+
+  /** Wake one parked producer - the queue just lost an entry. */
+  #releaseRoom() {
+    const waiter = this.#roomWaiters.shift();
+    if (waiter !== undefined) waiter();
   }
 
   _onWorkerMessage(worker, msg) {

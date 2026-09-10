@@ -1,15 +1,16 @@
 /**
  * worker.mjs - the far side of a Pool worker.
  *
- * Protocol (one message per task):
- *   in  { id, kind: 'module' | 'source' | 'noop', target, export, args, transfer }
- *   out { id, ok: true, value } | { id, ok: false, error: { name, message, stack } }
+ * Protocol:
+ *   single  in  { id, kind: 'module' | 'source' | 'noop', target, export, args }
+ *           out { id, ok: true, value } | { id, ok: false, error }
+ *   batch   in  { batch: true, tasks: [ ...same shape... ] }
+ *           out { batchResults: [ {id, ok, value|error}, ... ] }
  *
- * 'module' tasks import the module ONCE per worker and reuse the namespace
- * (piscina's model: no per-task import cost, no eval). 'source' tasks exist so
- * that \`pool.spawn(() => ...)\` feels like \`go func(){...}()\` - the function source is
- * shipped and re-created here, which is why closures cannot capture (documented
- * in DESIGN.md §4).
+ * Batching exists because a postMessage round trip measured 20.4 us on this host
+ * (see RESEARCH-scheduling.md §3): one message carrying N tasks pays it once. The
+ * tasks still run one after another, so a worker keeps its "one task at a time"
+ * semantics.
  */
 import { parentPort } from 'node:worker_threads';
 
@@ -36,40 +37,37 @@ function fromSource(source) {
   return fn;
 }
 
-function fail(id, error) {
-  port.postMessage({
-    id,
-    ok: false,
-    error: {
-      name: String(error?.name ?? 'Error'),
-      message: String(error?.message ?? error),
-      stack: typeof error?.stack === 'string' ? error.stack : undefined,
-    },
-  });
+function describe(error) {
+  return {
+    name: String(error?.name ?? 'Error'),
+    message: String(error?.message ?? error),
+    stack: typeof error?.stack === 'string' ? error.stack : undefined,
+  };
+}
+
+async function runOne(task) {
+  const id = task?.id;
+  try {
+    let value;
+    if (task.kind === 'module') {
+      const mod = await loadModule(task.target);
+      const name = task.export ?? 'default';
+      const fn = mod[name];
+      if (typeof fn !== 'function') throw new TypeError('goroutine: ' + task.target + ' has no exported function "' + name + '"');
+      value = await fn(...(task.args ?? []));
+    } else if (task.kind === 'source') {
+      value = await fromSource(task.target)(...(task.args ?? []));
+    } else if (task.kind === 'noop') {
+      value = undefined;
+    } else {
+      throw new TypeError('goroutine: unknown task kind ' + JSON.stringify(task.kind));
+    }
+    return { id, ok: true, value };
+  } catch (error) {
+    return { id, ok: false, error: describe(error) };
+  }
 }
 
 port.on('message', async (msg) => {
-  const id = msg?.id;
-  try {
-    let value;
-    if (msg.kind === 'module') {
-      const mod = await loadModule(msg.target);
-      const name = msg.export ?? 'default';
-      const fn = mod[name];
-      if (typeof fn !== 'function') throw new TypeError('goroutine: ' + msg.target + ' has no exported function "' + name + '"');
-      value = await fn(...(msg.args ?? []));
-    } else if (msg.kind === 'source') {
-      value = await fromSource(msg.target)(...(msg.args ?? []));
-    } else if (msg.kind === 'noop') {
-      value = undefined;
-    } else {
-      throw new TypeError('goroutine: unknown task kind ' + JSON.stringify(msg.kind));
-    }
-    if (msg.transferFromResult === true && value && typeof value === 'object') {
-      // caller asked for a zero-copy handoff of the result buffers
-    }
-    port.postMessage({ id, ok: true, value });
-  } catch (error) {
-    fail(id, error);
-  }
+  port.postMessage(await runOne(msg));
 });
