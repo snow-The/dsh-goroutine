@@ -1,0 +1,32 @@
+{
+  "name": "@snow-the/goroutine",
+  "version": "0.1.0",
+  "description": "Go-style goroutine/channel/task-pool primitives for JS runtimes, on worker_threads (Node/Bun/Deno compatible).",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./pool": "./src/pool.js",
+    "./channel": "./src/channel.js"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "DESIGN.md"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "keywords": [
+    "goroutine",
+    "worker_threads",
+    "worker-pool",
+    "channel",
+    "concurrency",
+    "dsh"
+  ]
+}
