@@ -44,7 +44,11 @@ async function heavyMath() { return 6 * 7; }
 |---|---|
 | Node v26.7.0 (`npm test`) | **17/17 pass** |
 | Deno 2.4.4 (`deno test --no-check --allow-read --allow-env test/`) | **17/17 pass** |
-| Bun | not installed here — untested; only `node:worker_threads`/`node:os`/`node:events` are used, so it should work. Install Bun and run `bun test test/` to confirm. |
+
+> Bun note: bare `bun test` also collects the git-ignored research checkout under
+> `ref/piscina/`, whose tests expect a build output that is not present. Run
+> `bun test ./test` to exercise this library's own suite.
+| Bun 1.4.2 (`bun test ./test`) | **17/17 pass** (verified 2026-09-11) |
 
 ## Design
 
